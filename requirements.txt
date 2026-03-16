@@ -1,0 +1,12 @@
+ipykernel
+tqdm
+python-dotenv
+scipy
+pandas
+numpy
+openai
+requests
+matplotlib
+plotly
+kaleido
+scikit-learn
