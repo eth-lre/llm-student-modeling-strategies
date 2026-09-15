@@ -17,8 +17,7 @@ class EqualityChecker(ABC):
         raise NotImplementedError()
 
 
-def judge_answer_equality_llm(client: OpenAI, model_config: dict, problem: str, answer_a: str, answer_b: str) -> bool:
-        system_prompt = """You are an AI assistant tasked with judging whether two answer choices to a middle-school multiple-choice math problem are semantically the same as one another. You must not solve the problem and not evaluate factual correctness — only compare the two answers with one another relative to the problem’s formatting requirements.
+MATH_EQUALITY_SYSTEM_PROMPT = """You are an AI assistant tasked with judging whether two answer choices to a middle-school multiple-choice math problem are semantically the same as one another. You must not solve the problem and not evaluate factual correctness — only compare the two answers with one another relative to the problem’s formatting requirements.
 
 Your output must follow this exact structure:
 
@@ -69,40 +68,95 @@ General Rules
 - Only compare answer_1 with answer_2.
 - answer_1 and answer_2 can be equivalent regardless of whether they are correct or not.
 """
-        user_prompt = f"""<math problem> {problem} </math problem>
+
+
+SCIENCE_EQUALITY_SYSTEM_PROMPT = """You are an AI assistant tasked with judging whether two answer choices to a middle-school multiple-choice science question are semantically the same as one another. You must not answer the question and not evaluate factual correctness — only compare the two answers with one another relative to what the question is asking.
+
+Your output must follow this exact structure:
+
+<equivalent> [TRUE/FALSE] </equivalent>
+
+Meaning of <equivalent>
+Two answers are equivalent if they refer to exactly the same scientific concept, entity, term, or value, differing only in:
+- capitalization, punctuation, pluralization, articles, or filler words
+- trivial formatting wrappers (e.g., LaTeX, extra whitespace)
+- abbreviation vs. its expansion (e.g., DNA vs. deoxyribonucleic acid)
+- well-established synonyms denoting the exact same referent (e.g., heat vs. thermal energy)
+- rewording that preserves the exact same referent without adding or removing entities
+
+Examples of equivalent:
+- photosynthesis = Photosynthesis
+- planet = a planet
+- mirrors = a mirror
+- DNA = deoxyribonucleic acid
+- heat = thermal energy
+- products = the products
+
+Two answers are NOT equivalent if:
+- they name different scientific concepts, even if closely related (e.g., photosynthesis vs. respiration, mirrors vs. lenses, circadian rhythm vs. circannual rhythm)
+- one is a subset or superset of the other, or introduces or removes entities (e.g., "protons and neutrons" vs. "protons")
+- they give different specific values or quantities (e.g., "less than half" vs. "5%", "type 1" vs. "type 2 diabetes")
+- they specify different levels of generality that change the referent (e.g., "bacteria" vs. "E. coli")
+
+Examples of NOT equivalent:
+- mirrors != lenses
+- protons and neutrons != protons
+- carbon != nitrogen
+- heat != ultraviolet
+
+General Rules
+- Do not answer the question.
+- Do not judge correctness of answer_1 and answer_2.
+- Only compare answer_1 with answer_2.
+- answer_1 and answer_2 can be equivalent regardless of whether they are correct or not.
+"""
+
+
+def _judge_answer_equality_llm(client: OpenAI, model_config: dict, system_prompt: str, problem: str, answer_a: str, answer_b: str) -> bool:
+    user_prompt = f"""<problem> {problem} </problem>
 <answer_1> {answer_a} </answer_1>
 <answer_2> {answer_b} </answer_2>
 """
-        response = prompt_openai(client=client, system_prompt=system_prompt, user_prompt=user_prompt, model_config=model_config)
-    
-        equivalences = re.findall(r"<equivalent>\s*(.*?)\s*</equivalent>", response)
-        if len(equivalences) > 1:
-            print(f"Warning, got multiple judgments when comparing answers, will pick the first one! {response}")
-        
-        equivalence = equivalences[0].strip().lower()
-        if equivalence not in {"true", "false"}:
-            print(f"Warning, got unexpected judgment {equivalence}, will resort to False! {response}")
-        if equivalence == "true":
-            return True
-        return False
+    response = prompt_openai(client=client, system_prompt=system_prompt, user_prompt=user_prompt, model_config=model_config)
 
-class SemanticEqualityChecker(EqualityChecker):
+    equivalences = re.findall(r"<equivalent>\s*(.*?)\s*</equivalent>", response)
+    if len(equivalences) > 1:
+        print(f"Warning, got multiple judgments when comparing answers, will pick the first one! {response}")
+
+    equivalence = equivalences[0].strip().lower()
+    if equivalence not in {"true", "false"}:
+        print(f"Warning, got unexpected judgment {equivalence}, will resort to False! {response}")
+    return equivalence == "true"
+
+
+def judge_math_answer_equality_llm(client: OpenAI, model_config: dict, problem: str, answer_a: str, answer_b: str) -> bool:
+    return _judge_answer_equality_llm(client, model_config, MATH_EQUALITY_SYSTEM_PROMPT, problem, answer_a, answer_b)
+
+
+def judge_science_answer_equality_llm(client: OpenAI, model_config: dict, problem: str, answer_a: str, answer_b: str) -> bool:
+    return _judge_answer_equality_llm(client, model_config, SCIENCE_EQUALITY_SYSTEM_PROMPT, problem, answer_a, answer_b)
+
+
+class _SemanticEqualityCheckerBase(EqualityChecker):
     """
-    Semantic checker: uses LLM-based equivalence if not trivially equivalent
+    Base class for semantic equality checkers: falls through exact-match shortcuts,
+    then defers to an LLM judge with a subject-specific system prompt.
+    Subclasses must set SYSTEM_PROMPT.
     """
-    def __init__(self, client: OpenAI, model_config: dict[str,str]):
+    SYSTEM_PROMPT: str = ""
+
+    def __init__(self, client: OpenAI, model_config: dict[str, str]):
         self.client = client
         self.model_config = model_config
         self.log: list[dict[str, Any]] = []
         self.memoization: dict[tuple, bool] = {}
-
 
     def is_equal(self, problem: str, answer_a: str, answer_b: str) -> bool:
         cached = self.memoization.get((problem, answer_a, answer_b),
                                       self.memoization.get((problem, answer_b, answer_a), None))
         if cached is not None:
             return cached
-            
+
         equivalence = self.judge_answer_equality(problem, answer_a, answer_b)
         self.log.append({**equivalence, "problem": problem, "answer_a": answer_a, "answer_b": answer_b})
         is_match = equivalence.get("match", False)
@@ -111,26 +165,20 @@ class SemanticEqualityChecker(EqualityChecker):
 
     def judge_answer_equality(self, problem: str, answer_a: Optional[str], answer_b: Optional[str]) -> Dict[str, Any]:
         """
-        Judge whether two answers A and B are semantically equivalent given problem using the strategy:
-        0. if one of the answers is none/empty and the other is not => no match
-        1. exact matches => equal
-        2. ask llm to judge (via _judge_answer_equality_llm)
+        0. if one answer is empty and the other isn't => no match
+        1. exact (case-insensitive) matches => equal
+        2. otherwise ask the LLM judge
         """
         if bool(len((answer_a or "").strip())) ^ bool(len((answer_b or "").strip())):
-            # one of the answers is empty, the other is not
             return {"match": False, "reason": "empty"}
 
         if answer_a.lower().strip() == answer_b.lower().strip():
             return {"match": True, "reason": "exact_match"}
 
-        # fallback to LLM equivalence
-        try:
-            if judge_answer_equality_llm(self.client, self.model_config, problem, answer_a or "", answer_b or ""):
-                return {"match": True, "reason": "llm_match"}
-        except Exception as e:
-            # If LLM fails, log and continue to return no_match
-            print(e)
-            return {"match": False, "reason": f"llm_error:{e}"}
+        # Any API failure propagates: we never fabricate (and then memoize) a False on error,
+        # which would silently corrupt the cache. A broken run must fail loudly, not poison.
+        if _judge_answer_equality_llm(self.client, self.model_config, self.SYSTEM_PROMPT, problem, answer_a or "", answer_b or ""):
+            return {"match": True, "reason": "llm_match"}
 
         return {"match": False, "reason": "no_match"}
 
@@ -153,40 +201,11 @@ class SemanticEqualityChecker(EqualityChecker):
         obj.memoization = data["memoization"]
         return obj
 
-class SemanticDoubleEqualityChecker(SemanticEqualityChecker):
-    """
-    Semantic checker: uses LLM-based equivalence, double check with a more competent model in case the trivial model reports equivalence (bc it's not always given)
-    """
-    def __init__(self, client: OpenAI, model_config: dict[str,str], expert_model_config: dict[str,str]):
-        super().__init__(client, model_config)
-        self.expert_model_config = expert_model_config
+class MathSemanticEqualityChecker(_SemanticEqualityCheckerBase):
+    SYSTEM_PROMPT = MATH_EQUALITY_SYSTEM_PROMPT
 
-    def judge_answer_equality(self, problem: str, answer_a: Optional[str], answer_b: Optional[str]) -> Dict[str, Any]:
-        """
-        Judge whether two answers A and B are semantically equivalent given problem using the strategy:
-        0. if one of the answers is none/empty and the other is not => no match
-        1. exact matches => equal
-        2. ask llm to judge (via _judge_answer_equality_llm)
-        """
-        if bool(len((answer_a or "").strip())) ^ bool(len((answer_b or "").strip())):
-            # one of the answers is empty, the other is not
-            return {"match": False, "reason": "empty"}
-
-        if answer_a.lower().strip() == answer_b.lower().strip():
-            return {"match": True, "reason": "exact_match"}
-
-        # fallback to LLM equivalence
-        try:
-            if judge_answer_equality_llm(self.client, self.model_config, problem, answer_a or "", answer_b or ""):
-                if judge_answer_equality_llm(self.client, self.expert_model_config, problem, answer_a or "", answer_b or ""):
-                    return {"match": True, "reason": "llm_match"}
-        except Exception as e:
-            # If LLM fails, log and continue to return no_match
-            print(e)
-            return {"match": False, "reason": f"llm_error:{e}"}
-
-        return {"match": False, "reason": "no_match"}
-
+class ScienceSemanticEqualityChecker(_SemanticEqualityCheckerBase):
+    SYSTEM_PROMPT = SCIENCE_EQUALITY_SYSTEM_PROMPT
 
 class NumericalEqualityChecker(EqualityChecker):
     """
@@ -216,6 +235,6 @@ class NumericalEqualityChecker(EqualityChecker):
         else:
             match = (a_int == b_int)
             equivalence = {"match": match, "reason": "int_match" if match else "int_mismatch", "a_int": a_int, "b_int": b_int}
-            
+
         is_match = equivalence["match"]
         return is_match

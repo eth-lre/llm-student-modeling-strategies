@@ -5,6 +5,10 @@ class SimulateModel(ABC):
         Abstract base class for simulating a student's incorrect answer
         given a specific misconception.
     """
+
+    def __init__(self, subject: str):
+        self.subject = subject
+
     @abstractmethod
     def simulate(
         self,

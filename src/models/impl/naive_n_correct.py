@@ -3,15 +3,15 @@ from openai import OpenAI
 from src.models.joint import JointModel
 from src.models.misconception import MisconceptionModel
 from src.models.simulation import SimulateModel
-from src.prompt_util import prompt_deepseek, prompt_openai
+from src.prompt_util import prompt_openai, prompt_openrouter
 
 
-def prompt_joint_naive(context: dict[str,str], n: int) -> dict[str,str]:
+def prompt_joint_naive(context: dict[str,str], n: int, subject: str = "math") -> dict[str,str]:
     question = context["Problem"]["Question"]
     answer = context["Problem"]["Answer"]
 
     return {
-        "system": f"""You will be given a math question along with the correct answer. Please generate {n} incorrect distractor answers for the question to be used as multiple-choice options in a multiple-choice exam.
+        "system": f"""You will be given a {subject} question along with the correct answer. Please generate {n} incorrect distractor answers for the question to be used as multiple-choice options in a multiple-choice exam.
 [Template]
 Distractor1:
 ...
@@ -41,11 +41,13 @@ def parse_joint_output(text: str) -> dict[str, str]:
 class DeepseekNaiveCorrectJointModel(JointModel):
     """Model using Deepseek API to propose a list of distractors with the simple possible prompt"""
 
-    def __init__(self, model_config: dict[str, str]):
+    def __init__(self, model_config: dict[str, str], subject: str = "math"):
         """
         Args:
             model_config: Dictionary with OpenAI model configuration (e.g., model name, temperature).
+            subject: Subject area for prompts (e.g., "math", "science")
         """
+        super().__init__(subject)
         self.model_config = model_config
 
     def generate_distractors(
@@ -57,7 +59,7 @@ class DeepseekNaiveCorrectJointModel(JointModel):
         Proposes a new list of distractors based on the given problem and reasoning.
         Returns (misconception, parsed_response_dict).
         """
-        prompts = prompt_joint_naive(context, num_distractors)
+        prompts = prompt_joint_naive(context, num_distractors, self.subject)
 
         system_prompt = prompts.get("system")
         user_prompt = prompts.get("user")
@@ -69,7 +71,7 @@ class DeepseekNaiveCorrectJointModel(JointModel):
             )
 
         
-        reasoning,response = prompt_deepseek(system_prompt, user_prompt, self.model_config)
+        reasoning, response = prompt_openrouter(system_prompt, user_prompt, self.model_config, stream=True)
         full_parsed_response = parse_joint_output(response)
 
         return [v for k,v in full_parsed_response.items() if k.endswith("_answer")], {

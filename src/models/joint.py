@@ -10,6 +10,9 @@ class JointModel(ABC):
         given the context (problem etc)
     """
 
+    def __init__(self, subject: str):
+        self.subject = subject
+
     @abstractmethod
     def generate_distractors(
         self, context: dict[str, str], num_distractors: int

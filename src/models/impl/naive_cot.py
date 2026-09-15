@@ -1,14 +1,14 @@
 import re
 from openai import OpenAI
 from src.models.joint import JointModel
-from src.prompt_util import prompt_deepseek, prompt_openai, prompt_openrouter
+from src.prompt_util import prompt_openai, prompt_openrouter
 
 
-def prompt_joint_naive(context: dict[str,str], n: int) -> dict[str,str]:
+def prompt_joint_naive(context: dict[str,str], n: int, subject: str = "math") -> dict[str,str]:
     question = context["Problem"]["Question"]
 
     return {
-        "system": f"""You will be given a math question. Please generate {n} incorrect distractor answers for the question to be used as multiple-choice options in a multiple-choice exam.
+        "system": f"""You will be given a {subject} question. Please generate {n} incorrect distractor answers for the question to be used as multiple-choice options in a multiple-choice exam.
 Think step-by-step before giving your final answer. Output only your step-by-step reasoning and the final distractors like so:
 
 [Step-By-Step]
@@ -78,12 +78,14 @@ def parse_joint_output(text: str) -> dict[str, str]:
 class OpenAINaiveCoTJointModel(JointModel):
     """Model using OpenAI API to propose a list of distractors with the simple possible prompt"""
 
-    def __init__(self, client: OpenAI, model_config: dict[str, str]):
+    def __init__(self, client: OpenAI, model_config: dict[str, str], subject: str = "math"):
         """
         Args:
             client: OpenAI client instance.
             model_config: Dictionary with OpenAI model configuration (e.g., model name, temperature)
+            subject: Subject area for prompts (e.g., "math", "science")
         """
+        super().__init__(subject)
         self.client = client
         self.model_config = model_config
 
@@ -96,7 +98,7 @@ class OpenAINaiveCoTJointModel(JointModel):
         Proposes a new list of distractors based on the given problem and reasoning.
         Returns (misconception, parsed_response_dict).
         """
-        prompts = prompt_joint_naive(context, num_distractors)
+        prompts = prompt_joint_naive(context, num_distractors, self.subject)
 
         system_prompt = prompts.get("system")
         user_prompt = prompts.get("user")
@@ -115,11 +117,13 @@ class OpenAINaiveCoTJointModel(JointModel):
 class DeepseekNaiveCoTJointModel(JointModel):
     """Model using Deepseek API to propose a list of distractors with the simple possible prompt"""
 
-    def __init__(self, model_config: dict[str, str]):
+    def __init__(self, model_config: dict[str, str], subject: str = "math"):
         """
         Args:
             model_config: Dictionary with OpenAI model configuration (e.g., model name, temperature).
+            subject: Subject area for prompts (e.g., "math", "science")
         """
+        super().__init__(subject)
         self.model_config = model_config
 
     def generate_distractors(
@@ -131,7 +135,7 @@ class DeepseekNaiveCoTJointModel(JointModel):
         Proposes a new list of distractors based on the given problem and reasoning.
         Returns (misconception, parsed_response_dict).
         """
-        prompts = prompt_joint_naive(context, num_distractors)
+        prompts = prompt_joint_naive(context, num_distractors, self.subject)
 
         system_prompt = prompts.get("system")
         user_prompt = prompts.get("user")
@@ -143,7 +147,7 @@ class DeepseekNaiveCoTJointModel(JointModel):
             )
 
         
-        reasoning,response = prompt_deepseek(system_prompt, user_prompt, self.model_config)
+        reasoning, response = prompt_openrouter(system_prompt, user_prompt, self.model_config, stream=True)
         full_parsed_response = parse_joint_output(response)
 
         return [v for k,v in full_parsed_response.items() if k.endswith("_answer")], {
@@ -155,25 +159,26 @@ class DeepseekNaiveCoTJointModel(JointModel):
 class OpenRouterNaiveCoTJointModel(JointModel):
     """Model using OpenRouter API to propose a list of distractors with chain-of-thought reasoning"""
 
-    def __init__(self, client: OpenAI, model_config: dict[str, str]):
+    def __init__(self, model_config: dict[str, str], subject: str = "math"):
         """
         Args:
-            client: OpenAI client instance (configured for OpenRouter).
             model_config: Dictionary with OpenRouter model configuration (api_key, model, temperature, etc.)
+            subject: Subject area for prompts (e.g., "math", "science")
         """
-        self.client = client
+        super().__init__(subject)
         self.model_config = model_config
 
     def generate_distractors(
         self,
         context: dict[str, str],
-        num_distractors: int
+        num_distractors: int,
+        stream: bool = False,
     ) -> tuple[list[str],dict[str,str]]:
         """
         Proposes a new list of distractors based on the given problem and reasoning.
         Returns (list of distractors, parsed_response_dict with reasoning).
         """
-        prompts = prompt_joint_naive(context, num_distractors)
+        prompts = prompt_joint_naive(context, num_distractors, self.subject)
 
         system_prompt = prompts.get("system")
         user_prompt = prompts.get("user")
@@ -184,7 +189,7 @@ class OpenRouterNaiveCoTJointModel(JointModel):
                 f"for context{context}"
             )
 
-        reasoning, response = prompt_openrouter(self.client, system_prompt, user_prompt, self.model_config)
+        reasoning, response = prompt_openrouter(system_prompt, user_prompt, self.model_config, stream=stream)
         full_parsed_response = parse_joint_output(response)
 
         return [v for k,v in full_parsed_response.items() if k.endswith("_answer")], {

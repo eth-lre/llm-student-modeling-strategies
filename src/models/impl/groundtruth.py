@@ -2,8 +2,8 @@ from src.models.misconception import MisconceptionModel
 
 class GroundTruthMisconceptionModel(MisconceptionModel):
     """ Pulls misconceptions from a groundtruth dataset """
-    def __init__(self):
-        super().__init__()
+    def __init__(self, subject: str = "math"):
+        super().__init__(subject)
 
     def propose(
         self, context: dict[str, str],

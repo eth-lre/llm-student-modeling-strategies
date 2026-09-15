@@ -7,6 +7,9 @@ class MisconceptionModel(ABC):
         given the exam context, problem, and previously tried misconceptions.
     """
 
+    def __init__(self, subject: str):
+        self.subject = subject
+
     @abstractmethod
     def propose(
         self, context: dict[str, str],

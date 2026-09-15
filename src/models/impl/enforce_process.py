@@ -1,14 +1,14 @@
 import re
 from openai import OpenAI
 from src.models.joint import JointModel
-from src.prompt_util import prompt_deepseek, prompt_openrouter
+from src.prompt_util import prompt_openrouter, prompt_openai, prompt_vllm
 
 
-def prompt_joint(context: dict[str,str], n: int, show_correct: bool) -> dict[str,str]:
+def prompt_joint(context: dict[str,str], n: int, show_correct: bool, subject: str = "math") -> dict[str,str]:
     question = context["Problem"]["Question"]
     answer = context["Problem"]["Answer"]
 
-    system_prompt = "You will be given a math question"
+    system_prompt = f"You will be given a {subject} question"
     user_prompt = f"Question: {question}"
     if show_correct:
         user_prompt += f"\nAnswer: {answer}"
@@ -73,14 +73,46 @@ def parse_joint_output(text: str) -> dict[str, str]:
         return results
 
 
+class OpenAIEnforceProcessJointModel(JointModel):
+    """Model using OpenAI API to propose a list of distractors while enforcing the process from the paper"""
+
+    def __init__(self, client: OpenAI, model_config: dict[str, str], show_correct: bool = False, subject: str = "math"):
+        super().__init__(subject)
+        self.client = client
+        self.model_config = model_config
+        self.show_correct = show_correct
+
+    def generate_distractors(
+        self,
+        context: dict[str, str],
+        num_distractors: int
+    ) -> tuple[list[str], dict[str, str]]:
+        prompts = prompt_joint(context, num_distractors, self.show_correct, self.subject)
+        system_prompt = prompts.get("system")
+        user_prompt = prompts.get("user")
+
+        if not system_prompt or not user_prompt:
+            raise ValueError(
+                f"Prompt function did not produce valid 'system' and 'user' prompts "
+                f"for context{context}"
+            )
+
+        response = prompt_openai(self.client, system_prompt, user_prompt, self.model_config)
+        full_parsed_response = parse_joint_output(response)
+
+        return [v for k, v in full_parsed_response.items() if k.endswith("_answer")], full_parsed_response
+
+
 class DeepseekEnforceProcessJointModel(JointModel):
     """Model using Deepseek API to propose a list of distractors while enforcing the process from the paper"""
 
-    def __init__(self, model_config: dict[str, str], show_correct: bool = False):
+    def __init__(self, model_config: dict[str, str], show_correct: bool = False, subject: str = "math"):
         """
         Args:
             model_config: Dictionary with OpenAI model configuration (e.g., model name, temperature).
+            subject: Subject area for prompts (e.g., "math", "science")
         """
+        super().__init__(subject)
         self.model_config = model_config
         self.show_correct = show_correct
 
@@ -93,7 +125,7 @@ class DeepseekEnforceProcessJointModel(JointModel):
         Proposes a new list of distractors based on the given problem and reasoning.
         Returns (misconception, parsed_response_dict).
         """
-        prompts = prompt_joint(context, num_distractors, self.show_correct)
+        prompts = prompt_joint(context, num_distractors, self.show_correct, self.subject)
 
         system_prompt = prompts.get("system")
         user_prompt = prompts.get("user")
@@ -105,7 +137,7 @@ class DeepseekEnforceProcessJointModel(JointModel):
             )
 
         
-        reasoning,response = prompt_deepseek(system_prompt, user_prompt, self.model_config)
+        reasoning, response = prompt_openrouter(system_prompt, user_prompt, self.model_config, stream=True)
         full_parsed_response = parse_joint_output(response)
 
         return [v for k,v in full_parsed_response.items() if k.endswith("_answer")], {
@@ -117,26 +149,27 @@ class DeepseekEnforceProcessJointModel(JointModel):
 class OpenRouterEnforceProcessJointModel(JointModel):
     """Model using OpenRouter API to propose a list of distractors while enforcing the process from the paper"""
 
-    def __init__(self, client: OpenAI, model_config: dict[str, str], show_correct: bool = False):
+    def __init__(self, model_config: dict[str, str], show_correct: bool = False, subject: str = "math"):
         """
         Args:
-            client: OpenRouter-compatible OpenAI client instance.
             model_config: Dictionary with OpenRouter model configuration (api_key, model, temperature, etc.)
+            subject: Subject area for prompts (e.g., "math", "science")
         """
-        self.client = client
+        super().__init__(subject)
         self.model_config = model_config
         self.show_correct = show_correct
 
     def generate_distractors(
         self,
         context: dict[str, str],
-        num_distractors: int
+        num_distractors: int,
+        stream: bool = False,
     ) -> tuple[list[str],dict[str,str]]:
         """
         Proposes a new list of distractors based on the given problem and reasoning.
         Returns (list of distractors, parsed_response_dict with reasoning).
         """
-        prompts = prompt_joint(context, num_distractors, self.show_correct)
+        prompts = prompt_joint(context, num_distractors, self.show_correct, self.subject)
 
         system_prompt = prompts.get("system")
         user_prompt = prompts.get("user")
@@ -147,11 +180,44 @@ class OpenRouterEnforceProcessJointModel(JointModel):
                 f"for context{context}"
             )
 
-        reasoning, response = prompt_openrouter(self.client, system_prompt, user_prompt, self.model_config)
+        reasoning, response = prompt_openrouter(system_prompt, user_prompt, self.model_config, stream=stream)
         full_parsed_response = parse_joint_output(response)
 
         return [v for k,v in full_parsed_response.items() if k.endswith("_answer")], {
             **full_parsed_response,
             "raw_reasoning": reasoning
         }
-    
+
+
+class VLLMEnforceProcessJointModel(JointModel):
+    """Model using a self-hosted vLLM (OpenAI-compatible) server to propose distractors via the
+    learning-science-informed enforce_process prompt. Captures reasoning_content."""
+
+    def __init__(self, client: OpenAI, model_config: dict[str, str], show_correct: bool = False, subject: str = "math"):
+        super().__init__(subject)
+        self.client = client
+        self.model_config = model_config
+        self.show_correct = show_correct
+
+    def generate_distractors(
+        self,
+        context: dict[str, str],
+        num_distractors: int
+    ) -> tuple[list[str], dict[str, str]]:
+        prompts = prompt_joint(context, num_distractors, self.show_correct, self.subject)
+        system_prompt = prompts.get("system")
+        user_prompt = prompts.get("user")
+
+        if not system_prompt or not user_prompt:
+            raise ValueError(
+                f"Prompt function did not produce valid 'system' and 'user' prompts "
+                f"for context{context}"
+            )
+
+        reasoning, response = prompt_vllm(self.client, system_prompt, user_prompt, self.model_config)
+        full_parsed_response = parse_joint_output(response)
+
+        return [v for k, v in full_parsed_response.items() if k.endswith("_answer")], {
+            **full_parsed_response,
+            "raw_reasoning": reasoning,
+        }

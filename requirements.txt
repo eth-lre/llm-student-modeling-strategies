@@ -7,6 +7,8 @@ numpy
 openai
 requests
 matplotlib
+seaborn
 plotly
 kaleido
 scikit-learn
+datasets

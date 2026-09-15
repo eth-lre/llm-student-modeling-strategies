@@ -1,5 +1,6 @@
 from collections import defaultdict
 from typing import Any
+import io
 import os
 import re
 import json
@@ -7,6 +8,7 @@ import random
 from abc import ABC, abstractmethod
 
 import pandas as pd
+from datasets import load_dataset
 
 class ADataset(ABC):
     """Abstract base class for datasets."""
@@ -86,6 +88,7 @@ class EEDIDataset(ADataset):
         if questionids is None:
             self.questionids = list(self.questions_df_extd["QuestionId"])
             if n_limit is not None:
+                n_limit = min(n_limit, len(self.questions_df_extd))
                 self.questionids = list(random.sample(list(self.questions_df_extd["QuestionId"]), k=n_limit))
         else:
             self.questionids = questionids
@@ -162,15 +165,107 @@ class EEDIDataset(ADataset):
             return cls(
                 data_folder = d["data_folder"],
                 n_limit = d["n_limit"],
-                questions_df = pd.read_json(d["questions_df"], orient="records", dtype={"QuestionId": str}),
+                questions_df = pd.read_json(io.StringIO(d["questions_df"]), orient="records", dtype={"QuestionId": str}),
                 questionids = d["questionids"],
             )
         
 
+class SciQDataset(ADataset):
+    """ Dataset of SciQ multiple-choice science questions from HuggingFace. """
+
+    def __init__(self, data_folder: str, split: str = "train", n_limit: int = None,
+                 items_by_qid: dict = None, questionids: list[str] = None):
+        super().__init__()
+        self.data_folder = data_folder
+        self.split = split
+        self.n_limit = n_limit
+
+        if items_by_qid is None:
+            hf_data = load_dataset("allenai/sciq", split=split)
+            self.items_by_qid = {
+                f"sciq_{split}_{i}": dict(hf_data[i])
+                for i in range(len(hf_data))
+            }
+        else:
+            self.items_by_qid = items_by_qid
+
+        solvable_path = os.path.join(data_folder, "problem_solvable_by_questionid.json")
+        if os.path.exists(solvable_path):
+            with open(solvable_path, "r") as f:
+                self.problem_solvable_by_qid = json.load(f)
+        else:
+            self.problem_solvable_by_qid = {}
+
+        if questionids is not None:
+            self.questionids = questionids
+        else:
+            all_ids = list(self.items_by_qid.keys())
+            if n_limit is not None:
+                self.questionids = random.sample(all_ids, min(n_limit, len(all_ids)))
+            else:
+                self.questionids = all_ids
+
+    def _get_problem(self, qid: str) -> dict[str, Any]:
+        item = self.items_by_qid[qid]
+        return {
+            "QuestionId": qid,
+            "Question": item["question"],
+            "Answer": item["correct_answer"],
+            "NumReasoningSteps": None,
+            "NumDistractors": 3,
+            "Solvable": self.problem_solvable_by_qid.get(qid, True),
+            "Distractor1": item["distractor1"],
+            "Distractor2": item["distractor2"],
+            "Distractor3": item["distractor3"],
+        }
+
+    def _get_choices(self, qid: str) -> dict[str, list[str]]:
+        item = self.items_by_qid[qid]
+        return {
+            "CorrectAnswer": item["correct_answer"],
+            "Distractors": [item["distractor1"], item["distractor2"], item["distractor3"]],
+        }
+
+    def __len__(self) -> int:
+        return len(self.questionids)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        qid = self.questionids[index]
+        return {
+            "Problem": self._get_problem(qid),
+            "Choices": self._get_choices(qid),
+            "NumDistractors": 3,
+        }
+
+    def save(self, path: str):
+        with open(path, "w+") as f:
+            json.dump({
+                "data_folder": self.data_folder,
+                "split": self.split,
+                "n_limit": self.n_limit,
+                # only persist the selected items to keep the file small
+                "items_by_qid": {qid: self.items_by_qid[qid] for qid in self.questionids},
+                "questionids": self.questionids,
+            }, f)
+
+    @classmethod
+    def load(cls, path: str):
+        with open(path, "r+") as f:
+            d = json.load(f)
+        return cls(
+            data_folder=d["data_folder"],
+            split=d["split"],
+            n_limit=d["n_limit"],
+            items_by_qid=d["items_by_qid"],
+            questionids=d["questionids"],
+        )
+
+
 def get_or_create_dataset(data_folder: str, n_limit: int|None = 100) -> ADataset:
     dataset_path = os.path.join(data_folder, f"dataset-{n_limit}.json")
     dataset_ctor = {
-        "eedi_data": EEDIDataset
+        "eedi_data": EEDIDataset,
+        "sciq_data": SciQDataset,
     }.get(data_folder, None)
 
     if dataset_ctor is None:
@@ -180,8 +275,50 @@ def get_or_create_dataset(data_folder: str, n_limit: int|None = 100) -> ADataset
         print(f"Loading existing dataset: {data_folder}")
         dataset = dataset_ctor.load(dataset_path)
         assert dataset.n_limit == n_limit
-    else:
-        print(f"Creating new dataset: {data_folder}")
-        dataset = dataset_ctor(data_folder, n_limit)
-        dataset.save(dataset_path)
+        return dataset
+
+    # Try to derive a strict-prefix subset from a larger existing dataset-{M}.json
+    # so that index-keyed results (datapoint_id = str(i)) align across runs.
+    if n_limit is not None:
+        sibling_re = re.compile(r"^dataset-(\d+)\.json$")
+        candidates = []
+        if os.path.isdir(data_folder):
+            for fname in os.listdir(data_folder):
+                m = sibling_re.match(fname)
+                if m:
+                    M = int(m.group(1))
+                    if M > n_limit:
+                        candidates.append(M)
+        if candidates:
+            M = max(candidates)
+            larger_path = os.path.join(data_folder, f"dataset-{M}.json")
+            print(f"Deriving subset dataset-{n_limit}.json from existing dataset-{M}.json")
+            larger = dataset_ctor.load(larger_path)
+            subset_qids = larger.questionids[:n_limit]
+            if dataset_ctor is EEDIDataset:
+                subset_df = larger.questions_df[larger.questions_df["QuestionId"].isin(subset_qids)]
+                dataset = EEDIDataset(
+                    data_folder=data_folder,
+                    n_limit=n_limit,
+                    questions_df=subset_df,
+                    questionids=subset_qids,
+                )
+            elif dataset_ctor is SciQDataset:
+                subset_items = {qid: larger.items_by_qid[qid] for qid in subset_qids}
+                dataset = SciQDataset(
+                    data_folder=data_folder,
+                    split=larger.split,
+                    n_limit=n_limit,
+                    items_by_qid=subset_items,
+                    questionids=subset_qids,
+                )
+            else:
+                dataset = None
+            if dataset is not None:
+                dataset.save(dataset_path)
+                return dataset
+
+    print(f"Creating new dataset: {data_folder}")
+    dataset = dataset_ctor(data_folder, n_limit=n_limit)
+    dataset.save(dataset_path)
     return dataset
